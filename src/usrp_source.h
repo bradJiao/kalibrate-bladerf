@@ -25,7 +25,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <rtl-sdr.h>
+#include <libbladeRF.h>
 
 #include "usrp_complex.h"
 #include "circular_buffer.h"
@@ -60,9 +60,9 @@ public:
 private:
 	void calculate_decimation();
 
-	rtlsdr_dev_t		*dev;
+	struct bladerf 		*dev;
 
-	float			m_sample_rate;
+	unsigned int		m_sample_rate;
 	float			m_desired_sample_rate;
 	unsigned int		m_decimation;
 
