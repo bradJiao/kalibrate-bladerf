@@ -45,6 +45,7 @@ extern int g_verbosity;
 #ifdef _WIN32
 inline double round(double x) { return floor(x + 0.5); }
 #endif
+inline unsigned int min(unsigned int a, unsigned int b){return a>b?b:a; }
 
 usrp_source::usrp_source(float sample_rate, long int fpga_master_clock_freq) {
 
@@ -78,7 +79,7 @@ usrp_source::~usrp_source() {
 
 	stop();
 	delete m_cb;
-	rtlsdr_close(dev);
+	bladerf_close(dev);
 	pthread_mutex_destroy(&m_u_mutex);
 }
 
@@ -124,7 +125,8 @@ int usrp_source::tune(double freq) {
 
 	pthread_mutex_lock(&m_u_mutex);
 	if (freq != m_center_freq) {
-		r = rtlsdr_set_center_freq(dev, (uint32_t)freq);
+		r = bladerf_set_frequency( dev, BLADERF_MODULE_RX, (uint32_t)freq );
+		//r = rtlsdr_set_center_freq(dev, (uint32_t)freq);
 //		fprintf(stderr, "Tuned to %i Hz.\n", (uint32_t)freq);
 
 		if (r < 0)
@@ -140,7 +142,7 @@ int usrp_source::tune(double freq) {
 
 int usrp_source::set_freq_correction(int ppm) {
 	m_freq_corr = ppm;
-	return rtlsdr_set_freq_correction(dev, ppm);
+	return 0;//rtlsdr_set_freq_correction(dev, ppm);
 }
 
 bool usrp_source::set_antenna(int antenna) {
@@ -149,17 +151,7 @@ bool usrp_source::set_antenna(int antenna) {
 }
 
 bool usrp_source::set_gain(float gain) {
-	int r, g = gain * 10;
-
-	/* Enable manual gain */
-	r = rtlsdr_set_tuner_gain_mode(dev, 1);
-	if (r < 0)
-		fprintf(stderr, "WARNING: Failed to enable manual gain.\n");
-
-	fprintf(stderr, "Setting gain: %.1f dB\n", gain/10);
-	r = rtlsdr_set_tuner_gain(dev, g);
-
-	return (r < 0) ? 0 : 1;
+	return 0;
 }
 
 
@@ -167,67 +159,79 @@ bool usrp_source::set_gain(float gain) {
  * open() should be called before multiple threads access usrp_source.
  */
 int usrp_source::open(unsigned int subdev) {
-	int i, r, device_count, count;
-	uint32_t dev_index = subdev;
+
 	uint32_t samp_rate = 270833;
 
 	m_sample_rate = 270833.002142;
 
-	device_count = rtlsdr_get_device_count();
-	if (!device_count) {
-		fprintf(stderr, "No supported devices found.\n");
-		exit(1);
+	int status = 0;
+	if(!dev) {
+		status = bladerf_open(&dev, NULL);// open default device
+		if (status) {
+			fprintf(stderr, "Failed to open device : %s\n", bladerf_strerror(status));
+			status = -1; 
+		}   
+
+		fprintf(stderr, "Using nuand LLC bladeRF \n" );
+
+		char serial[BLADERF_SERIAL_LENGTH];
+		if ( bladerf_get_serial( dev, serial ) == 0 ) 
+			fprintf(stderr, " SN %s",serial );
+		//std::cerr << " SN " << serial;
+
+		struct bladerf_version ver;
+		if ( bladerf_fw_version( dev, &ver ) == 0 ) 
+			fprintf(stderr, " FW v%i.%i.%i\n",ver.major,ver.minor,ver.patch);
+		//std::cerr << " FW v" << ver.major << "." << ver.minor << "." << ver.patch;
+
+
+		if ( bladerf_is_fpga_configured( dev ) != 1 ) 
+		{   
+			fprintf(stderr, "The FPGA is not configured! \n");
+			return -1; 
+		}   
+
+
+		bladerf_enable_module(dev,BLADERF_MODULE_RX, true);
+
+		status = bladerf_set_sample_rate(dev,BLADERF_MODULE_RX, samp_rate, &m_sample_rate);
+
+		fprintf(stderr, "Sample rate: %d\n", m_sample_rate);
 	}
 
-	fprintf(stderr, "Found %d device(s):\n", device_count);
-	for (i = 0; i < device_count; i++)
-		fprintf(stderr, "  %d:  %s\n", i, rtlsdr_get_device_name(i));
-	fprintf(stderr, "\n");
 
-	fprintf(stderr, "Using device %d: %s\n",
-		dev_index,
-		rtlsdr_get_device_name(dev_index));
 
-	r = rtlsdr_open(&dev, dev_index);
-	if (r < 0) {
-		fprintf(stderr, "Failed to open rtlsdr device #%d.\n", dev_index);
-		exit(1);
-	}
-
-	/* Set the sample rate */
-	r = rtlsdr_set_sample_rate(dev, samp_rate);
-	if (r < 0)
-		fprintf(stderr, "WARNING: Failed to set sample rate.\n");
 
 	/* Reset endpoint before we start reading from it (mandatory) */
-	r = rtlsdr_reset_buffer(dev);
-	if (r < 0)
-		fprintf(stderr, "WARNING: Failed to reset buffers.\n");
+	//r = rtlsdr_reset_buffer(dev);
+	//if (r < 0)
+		//fprintf(stderr, "WARNING: Failed to reset buffers.\n");
 
-//	r = rtlsdr_set_offset_tuning(dev, 1);
-//	if (r < 0)
-//		fprintf(stderr, "WARNING: Failed to enable offset tuning\n");
+	//	r = rtlsdr_set_offset_tuning(dev, 1);
+	//	if (r < 0)
+	//		fprintf(stderr, "WARNING: Failed to enable offset tuning\n");
 
 	return 0;
 }
 
-#define USB_PACKET_SIZE		(2 * 16384)
+#define USB_PACKET_SIZE		(16 * 1024)
 #define FLUSH_SIZE		512
 
+unsigned short ubuf[USB_PACKET_SIZE*2];
 
 int usrp_source::fill(unsigned int num_samples, unsigned int *overrun_i) {
 
-	unsigned char ubuf[USB_PACKET_SIZE];
 	unsigned int i, j, space, overruns = 0;
 	complex *c;
 	int n_read;
+	struct bladerf_metadata metadata;
 
 	while((m_cb->data_available() < num_samples) && (m_cb->space_available() > 0)) {
 
 		// read one usb packet from the usrp
 		pthread_mutex_lock(&m_u_mutex);
 
-		if (rtlsdr_read_sync(dev, ubuf, sizeof(ubuf), &n_read) < 0) {
+		if (bladerf_rx(dev,BLADERF_FORMAT_SC16_Q12, ubuf, sizeof(ubuf)/2, &metadata) < 0) {
 			pthread_mutex_unlock(&m_u_mutex);
 			fprintf(stderr, "error: usrp_standard_rx::read\n");
 			return -1;
@@ -239,11 +243,11 @@ int usrp_source::fill(unsigned int num_samples, unsigned int *overrun_i) {
 		c = (complex *)m_cb->poke(&space);
 
 		// set space to number of complex items to copy
-		space = n_read / 2;
+		space = min(sizeof(ubuf)/2, num_samples);
 
 		// write data
 		for(i = 0, j = 0; i < space; i += 1, j += 2)
-			c[i] = complex((ubuf[j] - 127) * 256, (ubuf[j + 1] - 127) * 256);
+			c[i] = complex((ubuf[j] - 2047) * 16, (ubuf[j + 1] - 2047) * 16);
 
 		// update cb
 		m_cb->wrote(i);
@@ -254,9 +258,6 @@ int usrp_source::fill(unsigned int num_samples, unsigned int *overrun_i) {
 		fprintf(stderr, "warning: local overrun\n");
 		overruns++;
 	}
-
-	if(overrun_i)
-		*overrun_i = overruns;
 
 	return 0;
 }
